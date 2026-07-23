@@ -33,7 +33,7 @@ jobs:
             --onefile `
             --console `
             --name FoxPointerScanner `
-            direct_pointer_candidate_scanner.py
+            fox_offset_finder.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
