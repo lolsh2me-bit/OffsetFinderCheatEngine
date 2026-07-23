@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Read-only multi-level pointer scanner for Windows.
+FoxPointerScanner — read-only pointer scanner for Windows.
 
-Назначение:
-- Ищет цепочки вида:
-    [[module.exe + ROOT] + off1] + off2 ... = TARGET
-- Ничего не записывает в память процесса.
-- Подходит для анализа собственных программ и тестовых стендов.
+Возможности:
+- поиск одноуровневых и многоуровневых pointer-chain;
+- обязательная автоматическая проверка найденных цепочек;
+- сохранение только цепочек, которые действительно разрешаются в TARGET;
+- сравнение сигнатур с предыдущим JSON-сканом;
+- пакетное чтение памяти процесса без записи в неё.
 
-Важно:
-- Для 64-битного процесса запускай 64-битную сборку Python/EXE.
-- Сканирование больших процессов может занимать долгое время.
-- Даже хороший pointer scan не гарантирует стабильную цепочку:
-  адрес может вычисляться динамически или не иметь статического корня.
+Формат цепочки:
+    address = module_base + root_offset
+    pointer = *(address)
+    address = pointer + offset_1
+    pointer = *(address)
+    address = pointer + offset_2
+    ...
+    final_address = pointer + offset_N
+
+Использовать только для собственных программ, тестовых стендов и процессов,
+на анализ которых имеется разрешение.
 """
 
 from __future__ import annotations
@@ -22,18 +29,18 @@ import bisect
 import ctypes
 import json
 import os
+import re
 import struct
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from ctypes import wintypes
 
 
 if os.name != "nt":
-    print("Этот скрипт работает только на Windows.")
+    print("[!] Данная программа поддерживает только Windows.")
     raise SystemExit(1)
 
 
@@ -55,7 +62,6 @@ PAGE_GUARD = 0x100
 PAGE_READONLY = 0x02
 PAGE_READWRITE = 0x04
 PAGE_WRITECOPY = 0x08
-PAGE_EXECUTE = 0x10
 PAGE_EXECUTE_READ = 0x20
 PAGE_EXECUTE_READWRITE = 0x40
 PAGE_EXECUTE_WRITECOPY = 0x80
@@ -71,12 +77,18 @@ READABLE_PROTECTIONS = {
 
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 MAX_PATH = 260
+STILL_ACTIVE = 259
+MIN_VALID_POINTER = 0x10000
+
+# 16 MiB — хороший компромисс между количеством системных вызовов и RAM.
+DEFAULT_CHUNK_SIZE = 16 * 1024 * 1024
+DEFAULT_MAX_PATHS_PER_NODE = 4
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 # ---------------------------------------------------------------------------
-# Structures
+# WinAPI structures
 # ---------------------------------------------------------------------------
 
 class PROCESSENTRY32W(ctypes.Structure):
@@ -123,41 +135,23 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
 
 
 # ---------------------------------------------------------------------------
-# Function signatures
+# WinAPI signatures
 # ---------------------------------------------------------------------------
 
 kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
 kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 
-kernel32.Process32FirstW.argtypes = [
-    wintypes.HANDLE,
-    ctypes.POINTER(PROCESSENTRY32W),
-]
+kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
 kernel32.Process32FirstW.restype = wintypes.BOOL
-
-kernel32.Process32NextW.argtypes = [
-    wintypes.HANDLE,
-    ctypes.POINTER(PROCESSENTRY32W),
-]
+kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
 kernel32.Process32NextW.restype = wintypes.BOOL
 
-kernel32.Module32FirstW.argtypes = [
-    wintypes.HANDLE,
-    ctypes.POINTER(MODULEENTRY32W),
-]
+kernel32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
 kernel32.Module32FirstW.restype = wintypes.BOOL
-
-kernel32.Module32NextW.argtypes = [
-    wintypes.HANDLE,
-    ctypes.POINTER(MODULEENTRY32W),
-]
+kernel32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
 kernel32.Module32NextW.restype = wintypes.BOOL
 
-kernel32.OpenProcess.argtypes = [
-    wintypes.DWORD,
-    wintypes.BOOL,
-    wintypes.DWORD,
-]
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 
 kernel32.ReadProcessMemory.argtypes = [
@@ -177,15 +171,15 @@ kernel32.VirtualQueryEx.argtypes = [
 ]
 kernel32.VirtualQueryEx.restype = ctypes.c_size_t
 
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
-kernel32.GetNativeSystemInfo.argtypes = [ctypes.c_void_p]
-kernel32.GetNativeSystemInfo.restype = None
-
 
 # ---------------------------------------------------------------------------
-# Data classes
+# Data models
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -239,13 +233,20 @@ class PointerChain:
         return f"{self.module.name.lower()}|{self.root_offset:X}|{offsets}"
 
     def pretty(self) -> str:
-        parts = [f"{self.module.name}+0x{self.root_offset:X}"]
-        parts.extend(f"+0x{offset:X}" for offset in self.offsets)
-        return " -> ".join(parts)
+        offsets = " -> ".join(f"+0x{value:X}" for value in self.offsets)
+        return f"{self.module.name}+0x{self.root_offset:X} -> {offsets}"
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    valid: bool
+    resolved_address: Optional[int]
+    failed_at_level: Optional[int]
+    reason: str
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Input and general helpers
 # ---------------------------------------------------------------------------
 
 def win_error(prefix: str) -> OSError:
@@ -256,8 +257,9 @@ def win_error(prefix: str) -> OSError:
 def parse_int(text: str) -> int:
     cleaned = text.strip().replace("`", "").replace("_", "").replace(" ", "")
     if not cleaned:
-        raise ValueError("Пустое число")
-    return int(cleaned, 0 if cleaned.lower().startswith(("0x", "0o", "0b")) else 16)
+        raise ValueError("Пустое значение")
+    base = 0 if cleaned.lower().startswith(("0x", "0o", "0b")) else 16
+    return int(cleaned, base)
 
 
 def ask_int(prompt: str, default: int, minimum: int, maximum: int) -> int:
@@ -267,11 +269,12 @@ def ask_int(prompt: str, default: int, minimum: int, maximum: int) -> int:
             return default
         try:
             value = int(raw, 10)
-            if minimum <= value <= maximum:
-                return value
-            print(f"Нужно число от {minimum} до {maximum}.")
         except ValueError:
-            print("Тут нужно обычное десятичное число.")
+            print("[-] Требуется десятичное целое число.")
+            continue
+        if minimum <= value <= maximum:
+            return value
+        print(f"[-] Допустимый диапазон: {minimum}–{maximum}.")
 
 
 def ask_hex(prompt: str, default: int, minimum: int, maximum: int) -> int:
@@ -281,59 +284,77 @@ def ask_hex(prompt: str, default: int, minimum: int, maximum: int) -> int:
             return default
         try:
             value = parse_int(raw)
-            if minimum <= value <= maximum:
-                return value
-            print(f"Нужно значение от 0x{minimum:X} до 0x{maximum:X}.")
         except ValueError:
-            print("Не понял число. Пример: 0x1000")
+            print("[-] Некорректное число. Пример: 0x1000.")
+            continue
+        if minimum <= value <= maximum:
+            return value
+        print(f"[-] Допустимый диапазон: 0x{minimum:X}–0x{maximum:X}.")
 
+
+def ask_choice(prompt: str, choices: Dict[str, str], default: str) -> str:
+    print(prompt)
+    for key, description in choices.items():
+        suffix = " (по умолчанию)" if key == default else ""
+        print(f"  {key}. {description}{suffix}")
+    while True:
+        value = input("Выбор: ").strip() or default
+        if value in choices:
+            return value
+        print(f"[-] Выберите один из вариантов: {', '.join(choices)}.")
+
+
+def safe_filename_component(value: str) -> str:
+    basename = Path(value).name
+    cleaned = re.sub(r"[^A-Za-zА-Яа-я0-9._-]+", "_", basename)
+    return cleaned.strip("._") or "process"
+
+
+# ---------------------------------------------------------------------------
+# Process and module enumeration
+# ---------------------------------------------------------------------------
 
 def find_processes(name: str) -> List[Tuple[int, str]]:
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
         raise win_error("CreateToolhelp32Snapshot(PROCESS)")
 
-    result: List[Tuple[int, str]] = []
+    matches: List[Tuple[int, str]] = []
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(entry)
-
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while ok:
-            exe = entry.szExeFile
-            if exe.lower() == name.lower() or name.lower() in exe.lower():
-                result.append((int(entry.th32ProcessID), exe))
+            executable = str(entry.szExeFile)
+            if executable.lower() == name.lower() or name.lower() in executable.lower():
+                matches.append((int(entry.th32ProcessID), executable))
             ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snapshot)
-
-    return result
+    return matches
 
 
 def choose_process() -> Tuple[int, str]:
     raw = input("Имя процесса или PID: ").strip()
     if not raw:
         raise ValueError("Процесс не указан")
-
     if raw.isdigit():
-        return int(raw), f"PID {raw}"
+        return int(raw), f"PID_{raw}"
 
     matches = find_processes(raw)
     if not matches:
         raise RuntimeError(f"Процесс «{raw}» не найден")
-
     if len(matches) == 1:
         return matches[0]
 
-    print("\nНашёл несколько процессов:")
-    for index, (pid, exe) in enumerate(matches, 1):
-        print(f"  {index}. {exe} — PID {pid}")
-
+    print("[+] Найдено несколько процессов:")
+    for index, (pid, executable) in enumerate(matches, 1):
+        print(f"    {index}. {executable} (PID {pid})")
     while True:
-        choice = input("Выбери номер: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(matches):
-            return matches[int(choice) - 1]
-        print("Нужен номер из списка.")
+        selected = input("Номер процесса: ").strip()
+        if selected.isdigit() and 1 <= int(selected) <= len(matches):
+            return matches[int(selected) - 1]
+        print("[-] Указан неверный номер.")
 
 
 def enumerate_modules(pid: int) -> List[ModuleInfo]:
@@ -348,14 +369,13 @@ def enumerate_modules(pid: int) -> List[ModuleInfo]:
     try:
         entry = MODULEENTRY32W()
         entry.dwSize = ctypes.sizeof(entry)
-
         ok = kernel32.Module32FirstW(snapshot, ctypes.byref(entry))
         while ok:
             base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
             modules.append(
                 ModuleInfo(
-                    name=entry.szModule,
-                    path=entry.szExePath,
+                    name=str(entry.szModule),
+                    path=str(entry.szExePath),
                     base=int(base),
                     size=int(entry.modBaseSize),
                 )
@@ -364,25 +384,38 @@ def enumerate_modules(pid: int) -> List[ModuleInfo]:
     finally:
         kernel32.CloseHandle(snapshot)
 
-    modules.sort(key=lambda module: module.base)
+    modules.sort(key=lambda item: item.base)
     return modules
 
 
-def module_for_address(modules: Sequence[ModuleInfo], address: int) -> Optional[ModuleInfo]:
-    # Модулей обычно немного, линейный проход здесь достаточно быстрый.
-    for module in modules:
-        if module.base <= address < module.end:
-            return module
-    return None
+def module_for_address(
+    modules: Sequence[ModuleInfo],
+    module_bases: Sequence[int],
+    address: int,
+) -> Optional[ModuleInfo]:
+    index = bisect.bisect_right(module_bases, address) - 1
+    if index < 0:
+        return None
+    module = modules[index]
+    return module if address < module.end else None
+
+
+# ---------------------------------------------------------------------------
+# Memory access
+# ---------------------------------------------------------------------------
+
+def process_is_alive(process_handle: int) -> bool:
+    exit_code = wintypes.DWORD(0)
+    if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
+        return False
+    return exit_code.value == STILL_ACTIVE
 
 
 def enumerate_regions(process_handle: int) -> List[MemoryRegion]:
     regions: List[MemoryRegion] = []
     address = 0
-    mbi = MEMORY_BASIC_INFORMATION()
-
-    # Практический верхний предел пользовательского адресного пространства x64.
     max_address = 0x00007FFFFFFFFFFF if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x7FFFFFFF
+    mbi = MEMORY_BASIC_INFORMATION()
 
     while address < max_address:
         result = kernel32.VirtualQueryEx(
@@ -392,20 +425,23 @@ def enumerate_regions(process_handle: int) -> List[MemoryRegion]:
             ctypes.sizeof(mbi),
         )
         if result == 0:
+            # VirtualQueryEx описывает MEM_FREE-регионы тоже. Ноль обычно означает
+            # достижение конца адресного пространства или фатальную ошибку запроса.
             break
 
         base = int(mbi.BaseAddress or 0)
         size = int(mbi.RegionSize or 0)
         protect = int(mbi.Protect)
+        protection_base = protect & 0xFF
 
         readable = (
-            mbi.State == MEM_COMMIT
+            int(mbi.State) == MEM_COMMIT
+            and size > 0
             and not (protect & PAGE_GUARD)
             and not (protect & PAGE_NOACCESS)
-            and (protect & 0xFF) in READABLE_PROTECTIONS
+            and protection_base in READABLE_PROTECTIONS
         )
-
-        if readable and size > 0:
+        if readable:
             regions.append(MemoryRegion(base=base, size=size, protect=protect))
 
         next_address = base + max(size, 0x1000)
@@ -419,10 +455,8 @@ def enumerate_regions(process_handle: int) -> List[MemoryRegion]:
 def read_chunk(process_handle: int, address: int, size: int) -> bytes:
     if size <= 0:
         return b""
-
     buffer = ctypes.create_string_buffer(size)
     bytes_read = ctypes.c_size_t(0)
-
     ok = kernel32.ReadProcessMemory(
         process_handle,
         ctypes.c_void_p(address),
@@ -430,36 +464,80 @@ def read_chunk(process_handle: int, address: int, size: int) -> bytes:
         size,
         ctypes.byref(bytes_read),
     )
-
     if not ok and bytes_read.value == 0:
         return b""
-
     return buffer.raw[: bytes_read.value]
+
+
+def read_pointer(process_handle: int, address: int, pointer_size: int) -> Optional[int]:
+    data = read_chunk(process_handle, address, pointer_size)
+    if len(data) != pointer_size:
+        return None
+    return int.from_bytes(data, byteorder="little", signed=False)
 
 
 def iter_region_chunks(
     process_handle: int,
     region: MemoryRegion,
     chunk_size: int,
-    overlap: int,
-) -> Iterable[Tuple[int, bytes]]:
+    pointer_size: int,
+) -> Iterator[Tuple[int, bytes, int]]:
+    """Читает блоки с look-ahead, не теряя указатели на границе чанков.
+
+    ``core_size`` задаёт число новых стартовых позиций в текущем блоке.
+    Дополнительные ``pointer_size - 1`` байт используются только для чтения
+    указателя, пересекающего границу, и повторно как стартовые позиции не
+    сканируются.
+    """
     cursor = region.base
-    end = region.end
-
-    while cursor < end:
-        request_size = min(chunk_size, end - cursor)
+    while cursor < region.end:
+        core_size = min(chunk_size, region.end - cursor)
+        request_size = min(core_size + pointer_size - 1, region.end - cursor)
         data = read_chunk(process_handle, cursor, request_size)
-
         if data:
-            yield cursor, data
+            yield cursor, data, core_size
+        cursor += core_size
 
-        advance = request_size
-        if request_size > overlap:
-            advance -= overlap
 
-        if advance <= 0:
-            break
-        cursor += advance
+# ---------------------------------------------------------------------------
+# Search and validation
+# ---------------------------------------------------------------------------
+
+def validate_chain(
+    process_handle: int,
+    chain: PointerChain,
+    target_address: int,
+    pointer_size: int,
+) -> ValidationResult:
+    current_address = chain.module.base + chain.root_offset
+
+    for level, offset in enumerate(chain.offsets, start=1):
+        pointer_value = read_pointer(process_handle, current_address, pointer_size)
+        if pointer_value is None:
+            return ValidationResult(
+                valid=False,
+                resolved_address=None,
+                failed_at_level=level,
+                reason=f"ReadProcessMemory failed at 0x{current_address:X}",
+            )
+        current_address = pointer_value + offset
+
+    if current_address != target_address:
+        return ValidationResult(
+            valid=False,
+            resolved_address=current_address,
+            failed_at_level=None,
+            reason=(
+                f"resolved to 0x{current_address:X}, expected 0x{target_address:X}"
+            ),
+        )
+
+    return ValidationResult(
+        valid=True,
+        resolved_address=current_address,
+        failed_at_level=None,
+        reason="ok",
+    )
 
 
 def find_parents_for_targets(
@@ -473,88 +551,97 @@ def find_parents_for_targets(
     candidate_cap: int,
     max_paths_per_node: int,
 ) -> Tuple[Dict[int, List[Tuple[Edge, ...]]], int, int, bool]:
-    """
-    Один обратный уровень.
+    """Выполняет один обратный уровень поиска.
 
-    Для каждого значения P в памяти ищется цель T, для которой:
-        P + offset == T
-        0 <= offset <= max_offset
+    Для каждого указателя P ищется T из текущего frontier, для которого:
+        0 <= T - P <= max_offset
     """
     sorted_targets = sorted(targets_to_paths)
-    new_paths: Dict[int, List[Tuple[Edge, ...]]] = {}
+    if not sorted_targets:
+        return {}, 0, 0, False
 
-    unpack_format = "<Q" if pointer_size == 8 else "<I"
+    new_paths: Dict[int, List[Tuple[Edge, ...]]] = {}
+    path_signatures: Dict[int, set[Tuple[Tuple[int, int, int, int], ...]]] = {}
+
+    unpacker = struct.Struct("<Q" if pointer_size == 8 else "<I")
     scanned_bytes = 0
     raw_hits = 0
     cap_reached = False
     last_progress = time.monotonic()
+    last_liveness_check = last_progress
 
-    for region_index, region in enumerate(regions, 1):
+    for region in regions:
         if cap_reached:
             break
 
-        for chunk_address, data in iter_region_chunks(
+        for chunk_address, data, core_size in iter_region_chunks(
             process_handle,
             region,
             chunk_size,
-            pointer_size - 1,
+            pointer_size,
         ):
-            scanned_bytes += len(data)
-            usable = len(data) - pointer_size + 1
+            scanned_bytes += core_size
+            max_start = min(core_size - 1, len(data) - pointer_size)
+            if max_start < 0:
+                continue
 
-            for local_offset in range(0, max(0, usable), scan_step):
-                pointer_value = struct.unpack_from(unpack_format, data, local_offset)[0]
-
-                # Нули и слишком маленькие значения почти всегда мусор.
-                if pointer_value < 0x10000:
+            for local_offset in range(0, max_start + 1, scan_step):
+                pointer_value = unpacker.unpack_from(data, local_offset)[0]
+                if pointer_value < MIN_VALID_POINTER:
                     continue
 
-                first = bisect.bisect_left(sorted_targets, pointer_value)
-                index = first
+                left = bisect.bisect_left(sorted_targets, pointer_value)
+                right = bisect.bisect_right(
+                    sorted_targets,
+                    pointer_value + max_offset,
+                    lo=left,
+                )
+                if left == right:
+                    continue
 
-                while index < len(sorted_targets):
-                    target = sorted_targets[index]
-                    offset = target - pointer_value
+                source_address = chunk_address + local_offset
+                existing = new_paths.setdefault(source_address, [])
+                signatures = path_signatures.setdefault(source_address, set())
 
-                    if offset < 0:
-                        index += 1
-                        continue
-                    if offset > max_offset:
-                        break
-
-                    source_address = chunk_address + local_offset
+                for target in sorted_targets[left:right]:
                     edge = Edge(
                         source_address=source_address,
                         pointer_value=pointer_value,
-                        offset=offset,
+                        offset=target - pointer_value,
                         target_address=target,
                     )
-
-                    existing = new_paths.setdefault(source_address, [])
                     for child_path in targets_to_paths[target]:
+                        if len(existing) >= max_paths_per_node:
+                            break
                         path = (edge,) + child_path
-                        if path not in existing:
-                            existing.append(path)
-                            raw_hits += 1
-                            if len(existing) >= max_paths_per_node:
-                                break
-
-                    if len(new_paths) >= candidate_cap:
-                        cap_reached = True
+                        signature = tuple(
+                            (item.source_address, item.pointer_value, item.offset, item.target_address)
+                            for item in path
+                        )
+                        if signature in signatures:
+                            continue
+                        signatures.add(signature)
+                        existing.append(path)
+                        raw_hits += 1
+                    if len(existing) >= max_paths_per_node:
                         break
 
-                    index += 1
-
-                if cap_reached:
+                if len(new_paths) >= candidate_cap:
+                    cap_reached = True
                     break
 
             now = time.monotonic()
-            if now - last_progress >= 2.5:
+            if now - last_progress >= 2.0:
                 print(
-                    f"    ищу... прочитал {scanned_bytes / (1024**2):.1f} МБ, "
-                    f"зацепок: {len(new_paths)}"
+                    f"    [*] Прочитано: {scanned_bytes / (1024**2):.1f} MiB | "
+                    f"узлов: {len(new_paths)} | путей: {raw_hits}"
                 )
                 last_progress = now
+
+            if now - last_liveness_check >= 1.0:
+                if not process_is_alive(process_handle):
+                    raise RuntimeError("Процесс завершился во время сканирования")
+                last_liveness_check = now
 
             if cap_reached:
                 break
@@ -577,15 +664,35 @@ def deduplicate_chains(chains: Iterable[PointerChain]) -> List[PointerChain]:
     )
 
 
+def validate_and_filter_chains(
+    process_handle: int,
+    chains: Iterable[PointerChain],
+    target_address: int,
+    pointer_size: int,
+) -> Tuple[List[PointerChain], int]:
+    valid: List[PointerChain] = []
+    rejected = 0
+    for chain in deduplicate_chains(chains):
+        result = validate_chain(process_handle, chain, target_address, pointer_size)
+        if result.valid:
+            valid.append(chain)
+        else:
+            rejected += 1
+    return valid, rejected
+
+
+# ---------------------------------------------------------------------------
+# JSON
+# ---------------------------------------------------------------------------
+
 def load_previous_signatures(path: str) -> set[str]:
     if not path:
         return set()
-
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     return {
         str(item["signature"])
         for item in data.get("results", [])
-        if "signature" in item
+        if isinstance(item, dict) and "signature" in item
     }
 
 
@@ -596,14 +703,19 @@ def save_results(
     pointer_size: int,
     max_offset: int,
     max_depth: int,
+    scan_step: int,
+    elapsed_seconds: float,
     chains: Sequence[PointerChain],
     stable_signatures: set[str],
+    rejected_during_validation: int,
+    scan_complete: bool,
 ) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in process_name)
-    output_path = Path(f"pointer_scan_{safe_name}_{timestamp}.json")
+    safe_name = safe_filename_component(process_name)
+    output_path = Path.cwd() / f"pointer_scan_{safe_name}_{timestamp}.json"
 
     payload = {
+        "scanner_version": "2.0",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "process": process_name,
         "pid": pid,
@@ -611,6 +723,14 @@ def save_results(
         "pointer_size": pointer_size,
         "max_offset": f"0x{max_offset:X}",
         "max_depth": max_depth,
+        "scan_step": scan_step,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "scan_complete": scan_complete,
+        "validation": {
+            "enabled": True,
+            "saved_only_valid_chains": True,
+            "rejected_chains": rejected_during_validation,
+        },
         "results": [
             {
                 "module": chain.module.name,
@@ -619,6 +739,8 @@ def save_results(
                 "offsets": [f"0x{offset:X}" for offset in chain.offsets],
                 "depth": chain.depth,
                 "signature": chain.signature,
+                "validated": True,
+                "resolved_address": f"0x{target:X}",
                 "stable_against_previous_scan": chain.signature in stable_signatures,
                 "display": chain.pretty(),
                 "edges": [
@@ -643,24 +765,39 @@ def save_results(
 
 
 # ---------------------------------------------------------------------------
-# Main scanner
+# Main
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    print("=" * 72)
-    print(" POINTER SCANNER — read-only, без записи в память")
-    print("=" * 72)
-    print("Йоу. Сейчас попробуем вытащить нормальные pointer-chain'ы.")
-    print("Работает только с процессами, которые тебе разрешено анализировать.\n")
+    print("=" * 76)
+    print(" FoxPointerScanner 2.0 — READ-ONLY POINTER SCANNER")
+    print("=" * 76)
+    print("[i] Программа не записывает данные в память выбранного процесса.")
+    print("[i] Используйте её только для разрешённого анализа.\n")
 
     if ctypes.sizeof(ctypes.c_void_p) != 8:
-        print("Бро, это 32-битная сборка.")
-        print("Для 64-битной игры собери EXE через Python x64.")
+        print("[-] Запущена 32-битная версия Python/EXE.")
+        print("[-] Для анализа 64-битного процесса требуется 64-битная сборка.")
         return 1
 
     try:
         pid, process_name = choose_process()
-        target = parse_int(input("Текущий адрес значения, например 0x123ABC: "))
+        target = parse_int(input("Текущий адрес целевого значения: "))
+
+        scan_mode = ask_choice(
+            "\nРежим поиска:",
+            {
+                "1": "Один оффсет (глубина 1)",
+                "2": "Многоуровневая pointer-chain",
+            },
+            default="2",
+        )
+        max_depth = 1 if scan_mode == "1" else ask_int(
+            "Максимальная глубина цепочки",
+            default=4,
+            minimum=2,
+            maximum=8,
+        )
 
         max_offset = ask_hex(
             "Максимальный оффсет",
@@ -668,34 +805,31 @@ def main() -> int:
             minimum=0,
             maximum=0x100000,
         )
-        max_depth = ask_int(
-            "Максимальная глубина цепочки",
-            default=4,
-            minimum=1,
-            maximum=8,
-        )
-        scan_step = ask_int(
-            "Шаг чтения указателей (4 точнее, 8 быстрее)",
-            default=4,
-            minimum=1,
-            maximum=8,
+        scan_step = int(
+            ask_choice(
+                "\nТочность сканирования:",
+                {
+                    "8": "Быстро — только 8-байтовое выравнивание",
+                    "4": "Сбалансированно — шаг 4 байта",
+                    "2": "Точно — шаг 2 байта",
+                    "1": "Максимально точно — каждый байт (значительно медленнее)",
+                },
+                default="4",
+            )
         )
         candidate_cap = ask_int(
-            "Лимит кандидатов на один уровень",
-            default=25000,
-            minimum=100,
-            maximum=500000,
+            "Лимит узлов на один уровень",
+            default=100000,
+            minimum=1000,
+            maximum=2_000_000,
         )
 
         previous_path = input(
-            "JSON прошлого скана для проверки стабильности "
-            "(Enter — пропустить): "
-        ).strip()
-
-        previous_signatures: set[str] = set()
-        if previous_path:
-            previous_signatures = load_previous_signatures(previous_path)
-            print(f"Загрузил прошлый скан: {len(previous_signatures)} сигнатур.")
+            "JSON предыдущего скана для сравнения (Enter — пропустить): "
+        ).strip().strip('"')
+        previous_signatures = load_previous_signatures(previous_path) if previous_path else set()
+        if previous_signatures:
+            print(f"[+] Загружено сигнатур предыдущего скана: {len(previous_signatures)}")
 
         process_handle = kernel32.OpenProcess(
             PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
@@ -703,47 +837,49 @@ def main() -> int:
             pid,
         )
         if not process_handle:
-            raise win_error(
-                "Не удалось открыть процесс. Попробуй запустить от администратора"
-            )
+            raise win_error("Не удалось открыть процесс")
 
         try:
+            if not process_is_alive(process_handle):
+                raise RuntimeError("Выбранный процесс уже завершён")
+
             modules = enumerate_modules(pid)
             regions = enumerate_regions(process_handle)
-
             if not modules:
                 raise RuntimeError("Не удалось получить список модулей процесса")
             if not regions:
-                raise RuntimeError("Не найдено доступных для чтения областей памяти")
+                raise RuntimeError("Не найдены читаемые регионы памяти")
 
+            module_bases = [module.base for module in modules]
             total_readable = sum(region.size for region in regions)
-            print(f"\nПроцесс: {process_name} (PID {pid})")
-            print(f"Цель: 0x{target:X}")
-            print(f"Модулей: {len(modules)}")
-            print(f"Читаемых регионов: {len(regions)}")
-            print(f"Объём читаемой памяти: {total_readable / (1024**3):.2f} ГБ")
-            print(
-                f"Параметры: depth={max_depth}, "
-                f"max_offset=0x{max_offset:X}, step={scan_step}\n"
-            )
 
-            # Адрес текущего узла -> варианты пути от него до конечной цели.
+            print("\n" + "-" * 76)
+            print(f"[+] Процесс: {process_name} (PID {pid})")
+            print(f"[+] Целевой адрес: 0x{target:X}")
+            print(f"[+] Модулей: {len(modules)}")
+            print(f"[+] Читаемых регионов: {len(regions)}")
+            print(f"[+] Читаемая память: {total_readable / (1024**3):.2f} GiB")
+            print(f"[+] Глубина: {max_depth}")
+            print(f"[+] Максимальный оффсет: 0x{max_offset:X}")
+            print(f"[+] Шаг: {scan_step} байт")
+            print("-" * 76)
+
             frontier: Dict[int, List[Tuple[Edge, ...]]] = {target: [tuple()]}
-            found_chains: List[PointerChain] = []
-            global_seen_nodes = {target}
-
+            found_candidates: List[PointerChain] = []
+            seen_heap_nodes = {target}
+            scan_complete = True
+            total_rejected = 0
             started = time.monotonic()
 
             for depth in range(1, max_depth + 1):
                 if not frontier:
-                    print(f"[{depth}/{max_depth}] Больше некуда копать.")
+                    print(f"[*] Уровень {depth}: дальнейшие узлы отсутствуют.")
                     break
 
                 print(
-                    f"[{depth}/{max_depth}] Сканирую уровень. "
-                    f"Целей на входе: {len(frontier)}"
+                    f"\n[*] Уровень {depth}/{max_depth}: "
+                    f"поиск родителей для {len(frontier)} целей..."
                 )
-
                 new_paths, scanned_bytes, raw_hits, cap_reached = find_parents_for_targets(
                     process_handle=process_handle,
                     regions=regions,
@@ -751,106 +887,105 @@ def main() -> int:
                     pointer_size=8,
                     max_offset=max_offset,
                     scan_step=scan_step,
-                    chunk_size=4 * 1024 * 1024,
+                    chunk_size=DEFAULT_CHUNK_SIZE,
                     candidate_cap=candidate_cap,
-                    max_paths_per_node=4,
+                    max_paths_per_node=DEFAULT_MAX_PATHS_PER_NODE,
                 )
 
                 print(
-                    f"    уровень готов: {scanned_bytes / (1024**2):.1f} МБ, "
-                    f"узлов {len(new_paths)}, путей {raw_hits}"
+                    f"[+] Уровень {depth} завершён: "
+                    f"{scanned_bytes / (1024**2):.1f} MiB, "
+                    f"узлов {len(new_paths)}, путей {raw_hits}."
                 )
-
                 if cap_reached:
+                    scan_complete = False
                     print(
-                        "    ух, кандидатов слишком много — упёрлись в лимит. "
-                        "Уменьши max offset или увеличь лимит."
+                        "[!] Достигнут лимит узлов. Результат текущего уровня неполный. "
+                        "Уменьшите максимальный оффсет или увеличьте лимит."
                     )
 
                 next_frontier: Dict[int, List[Tuple[Edge, ...]]] = {}
-                roots_this_level = 0
+                static_candidates: List[PointerChain] = []
 
                 for source_address, paths in new_paths.items():
-                    module = module_for_address(modules, source_address)
-
+                    module = module_for_address(modules, module_bases, source_address)
                     if module is not None:
-                        for path in paths:
-                            found_chains.append(
-                                PointerChain(
-                                    module=module,
-                                    root_offset=source_address - module.base,
-                                    edges=path,
-                                )
+                        static_candidates.extend(
+                            PointerChain(
+                                module=module,
+                                root_offset=source_address - module.base,
+                                edges=path,
                             )
-                            roots_this_level += 1
-                    elif source_address not in global_seen_nodes:
+                            for path in paths
+                        )
+                    elif source_address not in seen_heap_nodes:
                         next_frontier[source_address] = paths
-                        global_seen_nodes.add(source_address)
+                        seen_heap_nodes.add(source_address)
 
-                if roots_this_level:
-                    print(
-                        f"    йоу бро, кайф — статических цепочек на этом "
-                        f"уровне: {roots_this_level}"
-                    )
-                elif new_paths:
-                    print(
-                        "    что-то нашёл, но пока это heap-адреса. "
-                        "Копаю глубже..."
-                    )
-                else:
-                    print(
-                        "    эх, тут пусто. Либо цепочки нет, либо параметры "
-                        "слишком жёсткие."
-                    )
+                valid_now, rejected_now = validate_and_filter_chains(
+                    process_handle,
+                    static_candidates,
+                    target,
+                    pointer_size=8,
+                )
+                found_candidates.extend(valid_now)
+                total_rejected += rejected_now
+
+                print(f"[+] Статических кандидатов: {len(static_candidates)}")
+                print(f"[+] Автопроверку прошли: {len(valid_now)}")
+                if rejected_now:
+                    print(f"[-] Отклонено нерабочих цепочек: {rejected_now}")
 
                 frontier = next_frontier
 
             elapsed = time.monotonic() - started
-            chains = deduplicate_chains(found_chains)
+
+            # Повторная финальная проверка защищает от изменения памяти во время скана.
+            validated_chains, rejected_final = validate_and_filter_chains(
+                process_handle,
+                found_candidates,
+                target,
+                pointer_size=8,
+            )
+            total_rejected += rejected_final
 
             stable_signatures = {
                 chain.signature
-                for chain in chains
+                for chain in validated_chains
                 if chain.signature in previous_signatures
             }
 
-            print("\n" + "=" * 72)
-            print(f"Готово за {elapsed:.1f} сек.")
-            print(f"Уникальных статических цепочек: {len(chains)}")
+            display_chains = sorted(
+                validated_chains,
+                key=lambda chain: (
+                    chain.signature not in stable_signatures,
+                    chain.depth,
+                    chain.root_offset,
+                    chain.offsets,
+                ),
+            )
 
+            print("\n" + "=" * 76)
+            print(" РЕЗУЛЬТАТ")
+            print("=" * 76)
+            print(f"[+] Время сканирования: {elapsed:.2f} сек.")
+            print(f"[+] Рабочих уникальных цепочек: {len(display_chains)}")
+            print(f"[-] Всего отклонено автопроверкой: {total_rejected}")
+            print(f"[+] Полнота сканирования: {'полная' if scan_complete else 'неполная'}")
             if previous_signatures:
-                print(f"Совпало с прошлым сканом: {len(stable_signatures)}")
+                print(f"[+] Совпало с предыдущим сканом: {len(stable_signatures)}")
 
-            if chains:
-                print("\nЛучшие результаты:")
-                display_chains = sorted(
-                    chains,
-                    key=lambda chain: (
-                        chain.signature not in stable_signatures,
-                        chain.depth,
-                        chain.root_offset,
-                    ),
-                )
-
+            if display_chains:
+                print("\n[+] Лучшие подтверждённые цепочки:")
                 for index, chain in enumerate(display_chains[:50], 1):
-                    stable_mark = (
-                        " [СТАБИЛЬНАЯ, совпала с прошлым сканом]"
-                        if chain.signature in stable_signatures
-                        else ""
-                    )
-                    print(f"{index:>3}. {chain.pretty()}{stable_mark}")
-
-                if len(chains) > 50:
-                    print(f"...ещё {len(chains) - 50} результатов будут в JSON.")
+                    stable = " [STABLE]" if chain.signature in stable_signatures else ""
+                    print(f"    {index:>3}. {chain.pretty()}{stable}")
+                if len(display_chains) > 50:
+                    print(f"    ...ещё {len(display_chains) - 50} цепочек сохранено в JSON.")
             else:
-                print(
-                    "\nНичего статического не нашлось. Не обязательно баг:"
-                    "\n- значение может не иметь обычной pointer-chain;"
-                    "\n- max offset может быть мал;"
-                    "\n- глубины может не хватать;"
-                    "\n- адрес мог измениться во время поиска;"
-                    "\n- часть памяти может быть недоступна."
-                )
+                print("\n[-] Подтверждённые статические цепочки не найдены.")
+                print("[i] Возможные причины: недостаточная глубина, малый max_offset,")
+                print("[i] динамическое вычисление адреса или изменение TARGET во время скана.")
 
             output_path = save_results(
                 process_name=process_name,
@@ -859,31 +994,28 @@ def main() -> int:
                 pointer_size=8,
                 max_offset=max_offset,
                 max_depth=max_depth,
-                chains=chains,
+                scan_step=scan_step,
+                elapsed_seconds=elapsed,
+                chains=display_chains,
                 stable_signatures=stable_signatures,
+                rejected_during_validation=total_rejected,
+                scan_complete=scan_complete,
             )
-
-            print(f"\nРезультаты сохранены: {output_path.resolve()}")
-            print(
-                "Для более точного результата: перезапусти программу, "
-                "найди новый адрес значения и укажи этот JSON как прошлый скан."
-            )
-            print("Так случайный мусор отсеется, а стабильные цепочки останутся.")
-            input("\nEnter — закрыть...")
+            print(f"\n[+] JSON сохранён: {output_path.resolve()}")
+            print("[i] В файл записаны только цепочки, прошедшие автоматическую проверку.")
+            input("\nНажмите Enter для выхода...")
             return 0
 
         finally:
             kernel32.CloseHandle(process_handle)
 
     except KeyboardInterrupt:
-        print("\nОкей, остановили поиск.")
+        print("\n[!] Сканирование остановлено пользователем.")
         return 130
     except Exception as exc:
-        print(f"\nБро, что-то пошло не так: {exc}")
-        print(
-            "Проверь имя/PID, адрес, разрядность EXE и права доступа к процессу."
-        )
-        input("\nEnter — закрыть...")
+        print(f"\n[-] Ошибка: {exc}")
+        print("[i] Проверьте PID, адрес, разрядность Python/EXE и права доступа.")
+        input("\nНажмите Enter для выхода...")
         return 1
 
 
